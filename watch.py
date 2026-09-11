@@ -72,7 +72,7 @@ FEED_URL = ("https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent"
 HEADERS = {"User-Agent": "Michael michael.gonzalez@correounivalle.edu.co"}
 
 INTERVALO_POLL = 20          # segundos entre consultas al feed
-DURACION_MAX = 5 * 3600 + 40 * 60   # 5h40min -- margen bajo el limite duro de 6h
+DURACION_MAX = int(os.environ.get("WATCH_DURACION_SEG", 5 * 3600 + 40 * 60))  # override para pruebas cortas
 MAX_VISTOS = 20_000           # recorte del set de accession_no ya vistos
 
 RE_CIK = re.compile(r"\((\d{7,10})\)\s*\((?:Filer|Subject|Reporting)\)")
@@ -115,20 +115,32 @@ def commit_y_push(mensaje):
 def parsear_entradas_feed(xml_text):
     """Parseo minimo por regex, no XML completo -- el feed atom de EDGAR
     es simple y esto evita una dependencia extra. entry -> (titulo, cik,
-    accession_no, filing_date)."""
+    accession_no, filing_date).
+
+    FILTRO EXACTO DE FORM TYPE (encontrado 2026-09-11 probando en vivo):
+    el parametro `type=4` de la URL hace match por PREFIJO del lado del
+    servidor de SEC, no exacto -- devuelve tambien 424B2, 4/A, etc. Sin
+    este filtro, JPMorgan/BofA/Barclays (que filean 424B2 constantemente,
+    prospectos de bonos, no Form 4 de insiders) aparecian como "matches"
+    del universo y se hubieran procesado como si fueran transacciones de
+    insiders. El <category term=...> SI es el form type exacto."""
     entradas = []
     for bloque in xml_text.split("<entry>")[1:]:
         titulo_m = re.search(r"<title>(.*?)</title>", bloque, re.S)
         cik_m = RE_CIK.search(bloque)
         acc_m = RE_ACCNO.search(bloque)
         fecha_m = RE_FECHA.search(bloque)
-        if not (titulo_m and cik_m and acc_m):
+        tipo_m = re.search(r'label="form type" term="([^"]+)"', bloque)
+        if not (titulo_m and cik_m and acc_m and tipo_m):
+            continue
+        if tipo_m.group(1) not in ("4", "4/A"):
             continue
         entradas.append({
             "titulo": titulo_m.group(1),
             "cik": int(cik_m.group(1)),
             "accession_no": acc_m.group(1),
             "filing_date": fecha_m.group(1) if fecha_m else None,
+            "form_type": tipo_m.group(1),
         })
     return entradas
 
