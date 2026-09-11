@@ -1,0 +1,41 @@
+name: Watch Form 4 (casi tiempo real)
+
+on:
+  schedule:
+    # cada 5 min -- el piso que permite GitHub Actions. El loop de adentro
+    # de watch.py es lo que da la latencia real (poll cada 20s); esto solo
+    # asegura que, si el loop anterior murio o esta por llegar a su limite
+    # de duracion, el siguiente arranca sin un hueco largo. concurrency
+    # evita que corran dos loops a la vez.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: edgar-form4-live-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355  # backstop -- watch.py se cierra solo a los 340 min
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # historial completo, no shallow -- watch.py hace pull --rebase si hace falta
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      - run: |
+          git config user.name "edgar-form4-live bot"
+          git config user.email "actions@users.noreply.github.com"
+
+      - run: python watch.py
