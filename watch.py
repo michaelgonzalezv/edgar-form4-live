@@ -75,9 +75,38 @@ INTERVALO_POLL = 20          # segundos entre consultas al feed
 DURACION_MAX = int(os.environ.get("WATCH_DURACION_SEG", 5 * 3600 + 40 * 60))  # override para pruebas cortas
 MAX_VISTOS = 20_000           # recorte del set de accession_no ya vistos
 
-RE_CIK = re.compile(r"\((\d{7,10})\)\s*\((?:Filer|Subject|Reporting)\)")
-RE_ACCNO = re.compile(r"AccNo:</b>\s*([\d-]+)")
-RE_FECHA = re.compile(r"Filed:</b>\s*([\d-]+)")
+# BUG CRITICO ENCONTRADO 2026-09-11, despues de desplegar: este regex
+# exigia el rol (Filer|Subject|Reporting) y NO aceptaba (Issuer). En un
+# Form 4 la SEC emite una entrada por cada parte:
+#     4 - Ladiwala Shiraz Shabanali (0001715573) (Reporting)   <- la PERSONA
+#     4 - MESA LABORATORIES INC /CO/ (0000724004) (Issuer)     <- la EMPRESA
+# Nuestro universo son CIKs de EMPRESAS, o sea que la unica entrada que
+# puede matchear es la de (Issuer) -- justo la que el regex descartaba.
+# Con el regex viejo el watcher NO PODIA disparar nunca: matcheaba solo
+# entradas (Reporting), cuyo CIK es el de la persona fisica y jamas esta
+# en el universo. Los "0 hallazgos" parecian un viernes tranquilo y en
+# realidad era el sistema muerto -- el modo de falla mas peligroso de
+# todos, porque "no encontro nada" y "esta roto" se ven igual.
+# Ahora se acepta cualquier rol y se filtra por CIK: el CIK de un insider
+# persona nunca colisiona con el de una empresa del universo, asi que
+# matchear "cualquier rol" es seguro y ademas a prueba de que la SEC
+# cambie las etiquetas.
+RE_CIK = re.compile(r"\((\d{7,10})\)\s*\(([^)]+)\)")
+# SEGUNDO BUG CRITICO ENCONTRADO 2026-09-11 (independiente del de RE_CIK,
+# cada uno por su cuenta ya dejaba el watcher muerto): estos regex eran
+#     r"AccNo:</b>\s*([\d-]+)"   y   r"Filed:</b>\s*([\d-]+)"
+# pero el <summary> del feed viene con las etiquetas ESCAPADAS como
+# entidades HTML, no como markup literal:
+#     &lt;b&gt;Filed:&lt;/b&gt; 2026-09-11 &lt;b&gt;AccNo:&lt;/b&gt; 0000724004-26-000096
+# o sea que `</b>` nunca aparecia y el regex NUNCA matcheaba ->
+# parsear_entradas_feed() devolvia [] en todos los ciclos, para siempre.
+# Se toma el accession del <id> y la fecha/hora del <updated>, que vienen
+# sin escapar. Ademas <updated> es MEJOR que "Filed:": trae la hora exacta
+# de aceptacion con segundos (justo el dato que la seccion 60 del proyecto
+# tuvo que salir a buscar aparte), y permite medir la latencia real de
+# deteccion en vez de suponerla.
+RE_ACCNO = re.compile(r"accession-number=([\d-]+)")
+RE_UPDATED = re.compile(r"<updated>([^<]+)</updated>")
 
 
 def cargar_json(path, default):
@@ -90,6 +119,23 @@ def cargar_json(path, default):
 def guardar_json(path, obj):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False)
+
+
+def marcar_visto(vistos, orden_vistos, accession_no):
+    """Marca un accession_no como procesado, con purga POR ANTIGUEDAD.
+
+    Antes esto era `vistos = set(list(vistos)[-MAX_VISTOS:])`, que esta mal:
+    un `set` de Python no tiene orden, asi que ese recorte tiraba un
+    subconjunto arbitrario (el que quedara segun el hash), no los mas
+    viejos -- podia descartar un accession recien visto y reprocesarlo. Con
+    una lista paralela el orden de insercion es real y la purga saca por la
+    punta vieja."""
+    if accession_no in vistos:
+        return
+    vistos.add(accession_no)
+    orden_vistos.append(accession_no)
+    while len(orden_vistos) > MAX_VISTOS:
+        vistos.discard(orden_vistos.pop(0))
 
 
 def git(*args, check=True):
@@ -129,17 +175,20 @@ def parsear_entradas_feed(xml_text):
         titulo_m = re.search(r"<title>(.*?)</title>", bloque, re.S)
         cik_m = RE_CIK.search(bloque)
         acc_m = RE_ACCNO.search(bloque)
-        fecha_m = RE_FECHA.search(bloque)
+        upd_m = RE_UPDATED.search(bloque)
         tipo_m = re.search(r'label="form type" term="([^"]+)"', bloque)
         if not (titulo_m and cik_m and acc_m and tipo_m):
             continue
         if tipo_m.group(1) not in ("4", "4/A"):
             continue
+        aceptado = upd_m.group(1) if upd_m else None
         entradas.append({
             "titulo": titulo_m.group(1),
             "cik": int(cik_m.group(1)),
+            "rol": cik_m.group(2),          # Issuer / Reporting / Filer...
             "accession_no": acc_m.group(1),
-            "filing_date": fecha_m.group(1) if fecha_m else None,
+            "aceptado_en": aceptado,        # hora exacta de aceptacion en EDGAR
+            "filing_date": aceptado[:10] if aceptado else None,
             "form_type": tipo_m.group(1),
         })
     return entradas
@@ -148,13 +197,24 @@ def parsear_entradas_feed(xml_text):
 def parsear_form4_puntual(ticker, cik, accession_no):
     """Busca ESE accession_no puntual en los filings recientes de la
     empresa -- no escanea el historial completo. El feed ya nos dijo que
-    es nuevo, esto solo trae el detalle (owners, shares, price, code)."""
+    es nuevo, esto solo trae el detalle (owners, shares, price, code).
+
+    Devuelve (filas, resuelto). `resuelto` distingue dos casos que NO son
+    lo mismo y que al principio se trataban igual (bug 2026-09-11):
+      - resuelto=True  : se llego al documento y se leyo. Puede devolver
+                         cero filas legitimamente (un Form 4 solo de
+                         derivados, por ejemplo) -- eso NO se reintenta.
+      - resuelto=False : no se pudo llegar/parsear (timeout, error de
+                         edgartools, todavia no visible en el indice de la
+                         empresa). Eso SI se reintenta en el proximo ciclo.
+    Sin esta distincion habia que elegir entre perder filings por un error
+    transitorio, o reintentar para siempre los que no tienen filas."""
     try:
         company = Company(ticker)
         filings = company.get_filings(form="4").head(50)
     except Exception as e:
         print(f"    ERROR abriendo {ticker}: {e}")
-        return []
+        return [], False
 
     objetivo = None
     for f in filings:
@@ -162,16 +222,18 @@ def parsear_form4_puntual(ticker, cik, accession_no):
             objetivo = f
             break
     if objetivo is None:
-        print(f"    {ticker} {accession_no}: no encontrado en los ultimos 50 (raro, revisar)")
-        return []
+        # Caso normal, no error: el feed global suele publicar el filing
+        # unos segundos antes de que aparezca en el indice por empresa.
+        print(f"    {ticker} {accession_no}: todavia no esta en el indice de la empresa")
+        return [], False
 
     try:
         form4 = objetivo.obj()
     except Exception as e:
         print(f"    ERROR parseando {ticker} {accession_no}: {e}")
-        return []
+        return [], False
     if form4 is None:
-        return []
+        return [], True  # pre-2003 sin XML: no hay nada que sacar, no reintentar
 
     filing_date = str(objetivo.filing_date)
     form_type = getattr(objetivo, "form", None)
@@ -189,7 +251,7 @@ def parsear_form4_puntual(ticker, cik, accession_no):
     if nd_table is not None and nd_table.non_market_trades is not None and not nd_table.non_market_trades.empty:
         parts.append(nd_table.non_market_trades)
     if not parts:
-        return []
+        return [], True  # Form 4 leido bien pero sin Table I (solo derivados)
     trades = pd.concat(parts, ignore_index=True)
     footnote_map = form4.footnotes or {}
 
@@ -225,7 +287,7 @@ def parsear_form4_puntual(ticker, cik, accession_no):
             "footnote_text": " || ".join(t for t in footnote_texts if t) if footnote_texts else None,
             "detectado_en": datetime.now(timezone.utc).isoformat(),
         })
-    return filas
+    return filas, True
 
 
 def main():
@@ -234,21 +296,28 @@ def main():
     por_cik = {int(e["cik"]): e["ticker"] for e in universo}
     print(f"universo: {len(por_cik)} empresas")
 
-    vistos = set(cargar_json(VISTOS_PATH, []))
+    # se persiste como LISTA en orden de insercion (no `sorted`), para que
+    # la purga por antiguedad de marcar_visto() sobreviva a un reinicio.
+    orden_vistos = list(cargar_json(VISTOS_PATH, []))
+    vistos = set(orden_vistos)
     inicio = time.time()
     ciclos = 0
     total_encontradas = 0
 
     while time.time() - inicio < DURACION_MAX:
         ciclos += 1
+        entradas = []
         try:
             r = requests.get(FEED_URL, headers=HEADERS, timeout=15)
             r.raise_for_status()
             entradas = parsear_entradas_feed(r.text)
         except Exception as e:
+            # NO se hace `continue` aca (bug 2026-09-11): el `continue`
+            # saltaba tambien el bloque del latido de mas abajo, asi que
+            # una racha de timeouts de SEC -- que ya se vieron, 2 en 4
+            # minutos de prueba local -- dejaba latido.json congelado y
+            # hacia parecer que el loop estaba muerto cuando seguia vivo.
             print(f"  ciclo {ciclos}: error consultando el feed: {e}")
-            time.sleep(INTERVALO_POLL)
-            continue
 
         nuevas_filas = []
         for e in entradas:
@@ -256,12 +325,18 @@ def main():
                 continue
             if e["accession_no"] in vistos:
                 continue
-            vistos.add(e["accession_no"])
             ticker = por_cik[e["cik"]]
-            print(f"  ciclo {ciclos}: {ticker} ({e['cik']}) {e['accession_no']} -- parseando...")
-            filas = parsear_form4_puntual(ticker, e["cik"], e["accession_no"])
-            if filas:
-                nuevas_filas.extend(filas)
+            print(f"  ciclo {ciclos}: {ticker} ({e['cik']}, {e['rol']}) {e['accession_no']} -- parseando...")
+            filas, resuelto = parsear_form4_puntual(ticker, e["cik"], e["accession_no"])
+            # MARCAR COMO VISTO SOLO SI SE RESOLVIO (bug 2026-09-11): antes
+            # se marcaba ANTES de parsear, asi que un timeout o un error
+            # puntual de edgartools quemaba ese accession_no para siempre
+            # -- se perdia la senal sin dejar rastro. Ahora un fallo lo
+            # deja sin marcar y el proximo ciclo (20s despues) reintenta.
+            if resuelto:
+                marcar_visto(vistos, orden_vistos, e["accession_no"])
+                if filas:
+                    nuevas_filas.extend(filas)
 
         if nuevas_filas:
             ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -272,9 +347,7 @@ def main():
             total_encontradas += len(nuevas_filas)
             print(f"  {len(nuevas_filas)} transacciones nuevas -> {out_path}")
 
-            if len(vistos) > MAX_VISTOS:
-                vistos = set(list(vistos)[-MAX_VISTOS:])
-            guardar_json(VISTOS_PATH, sorted(vistos))
+            guardar_json(VISTOS_PATH, orden_vistos)
             commit_y_push(f"watch: {len(nuevas_filas)} transacciones nuevas "
                            f"({datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')})")
 
@@ -284,13 +357,13 @@ def main():
                 "ciclos": ciclos, "total_encontradas": total_encontradas,
             })
             commit_y_push(f"watch: latido ciclo {ciclos}")
-            guardar_json(VISTOS_PATH, sorted(vistos))  # persistir vistos igual sin hallazgos
+            guardar_json(VISTOS_PATH, orden_vistos)  # persistir vistos igual sin hallazgos
 
         time.sleep(INTERVALO_POLL)
 
     print(f"fin del loop: {ciclos} ciclos, {total_encontradas} transacciones en "
           f"{(time.time()-inicio)/60:.1f} min -- el proximo disparo de cron toma la posta")
-    guardar_json(VISTOS_PATH, sorted(vistos))
+    guardar_json(VISTOS_PATH, orden_vistos)
     guardar_json(LATIDO_PATH, {
         "ultimo_latido": datetime.now(timezone.utc).isoformat(),
         "ciclos": ciclos, "total_encontradas": total_encontradas, "cerrado_por_duracion_max": True,
