@@ -139,8 +139,18 @@ def marcar_visto(vistos, orden_vistos, accession_no):
 
 
 def git(*args, check=True):
-    return subprocess.run(["git", "-C", BASE, *args], check=check,
-                           capture_output=True, text=True)
+    """TIMEOUT OBLIGATORIO (2026-09-13). Sin el, un `git push` que se cuelga
+    bloquea el loop entero para siempre: el proceso sigue vivo, el job sigue
+    `in_progress` y verde en la interfaz de Actions, y el watcher esta muerto
+    por dentro sin que nada lo delate. Paso exactamente eso -- 2,5 horas sin
+    un solo ciclo ni latido, y el job se veia sano. 60s alcanza de sobra para
+    cualquier operacion de git en un repo de este tamano."""
+    try:
+        return subprocess.run(["git", "-C", BASE, *args], check=check,
+                               capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        print(f"  AVISO: git {' '.join(args)} supero el timeout, se ignora y sigue")
+        return subprocess.CompletedProcess(args, returncode=1, stdout="", stderr="timeout")
 
 
 def commit_y_push(mensaje):
@@ -352,12 +362,19 @@ def main():
                            f"({datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')})")
 
         if ciclos % 30 == 0:  # latido cada ~10 min (30 ciclos x 20s)
-            guardar_json(LATIDO_PATH, {
-                "ultimo_latido": datetime.now(timezone.utc).isoformat(),
-                "ciclos": ciclos, "total_encontradas": total_encontradas,
-            })
-            commit_y_push(f"watch: latido ciclo {ciclos}")
-            guardar_json(VISTOS_PATH, orden_vistos)  # persistir vistos igual sin hallazgos
+            # Envuelto porque publicar el latido NO puede ser motivo para
+            # perder el watcher: si git falla, prefiero un latido viejo y un
+            # loop vivo antes que un latido perfecto y un proceso muerto.
+            try:
+                guardar_json(LATIDO_PATH, {
+                    "ultimo_latido": datetime.now(timezone.utc).isoformat(),
+                    "ciclos": ciclos, "total_encontradas": total_encontradas,
+                })
+                commit_y_push(f"watch: latido ciclo {ciclos}")
+                guardar_json(VISTOS_PATH, orden_vistos)
+            except Exception as e:
+                print(f"  AVISO: fallo el latido del ciclo {ciclos}: {e}")
+            print(f"  vivo: ciclo {ciclos}, {total_encontradas} hallazgos", flush=True)
 
         time.sleep(INTERVALO_POLL)
 

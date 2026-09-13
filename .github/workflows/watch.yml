@@ -38,4 +38,4 @@ jobs:
           git config user.name "edgar-form4-live bot"
           git config user.email "actions@users.noreply.github.com"
 
-      - run: python watch.py
+      - run: python -u watch.py
