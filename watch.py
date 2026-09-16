@@ -31,12 +31,20 @@ la logica de trading vive en Information Factor (privado, local).
 
 QUE HACE.
   1. Cada INTERVALO_POLL segundos, pide el feed de ultimos Form 4.
-  2. Cruza cada entrada contra data/universo.json (las 788 empresas de
-     Information Factor) por CIK.
+  2. Parsea TODOS los Form 4 del mercado (2026-09-16: se saco el filtro
+     por data/universo.json que habia hasta ahora -- decision explicita
+     de Information Factor de escuchar todo el mercado en vivo, no solo
+     el universo de 794 empresas validado en el backtest historico. Cada
+     fila de salida se etiqueta "universe_type": "verified" (esta en las
+     794) o "expanded" (no esta) -- la separacion vive en el consumidor
+     privado (Information Factor), no aca: este repo solo capta y
+     etiqueta, nunca decide que es senal de trading.
   3. Si el accession_no no esta en data/vistos.json, lo parsea completo
-     (Company(ticker).get_filings() filtrado a ESE accession_no puntual --
-     no escanea el historial, se detiene apenas lo encuentra) y lo agrega
-     al buffer.
+     (Company(ticker_o_cik).get_filings() filtrado a ESE accession_no
+     puntual -- no escanea el historial, se detiene apenas lo encuentra)
+     y lo agrega al buffer. Para CIK sin ticker conocido (fuera de
+     universo.json) se abre por CIK directo -- Company() de edgartools
+     acepta cik_or_ticker indistintamente.
   4. Apenas hay algo nuevo en el buffer, lo escribe a
      data/inbox/<timestamp>.jsonl, commitea y pushea DE INMEDIATO -- no se
      bufferea por tiempo, la prioridad es que aparezca en git lo antes
@@ -44,6 +52,12 @@ QUE HACE.
   5. Se detiene solo un rato antes del limite duro de 6h de los runners
      hosted de GitHub (DURACION_MAX), para que el siguiente disparo de
      cron (cada 5 min, con concurrency-group) tome la posta sin hueco.
+
+VOLUMEN Y RATE LIMIT (relevante desde que se sacó el filtro de universo):
+escuchar TODO el mercado multiplica el numero de filings a parsear por
+ciclo (de un puñado a potencialmente decenas). Cada parseo es un llamado
+HTTP aparte a EDGAR -- se agrego SLEEP_ENTRE_FILINGS entre cada uno para
+no exceder el fair-use de SEC (10 req/s), ver docs.sec.gov/webmaster-faq.
 
 Mezcla a edgar_data.db: mismo mecanismo que edgar-form4-feed, ver README.
 """
@@ -72,6 +86,7 @@ FEED_URL = ("https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent"
 HEADERS = {"User-Agent": "Michael michael.gonzalez@correounivalle.edu.co"}
 
 INTERVALO_POLL = 20          # segundos entre consultas al feed
+SLEEP_ENTRE_FILINGS = 0.35   # entre parseos individuales dentro de un mismo ciclo -- fair-use SEC
 DURACION_MAX = int(os.environ.get("WATCH_DURACION_SEG", 5 * 3600 + 40 * 60))  # override para pruebas cortas
 MAX_VISTOS = 20_000           # recorte del set de accession_no ya vistos
 
@@ -204,10 +219,15 @@ def parsear_entradas_feed(xml_text):
     return entradas
 
 
-def parsear_form4_puntual(ticker, cik, accession_no):
+def parsear_form4_puntual(cik, accession_no, universe_type, ticker_conocido=None):
     """Busca ESE accession_no puntual en los filings recientes de la
     empresa -- no escanea el historial completo. El feed ya nos dijo que
     es nuevo, esto solo trae el detalle (owners, shares, price, code).
+
+    ticker_conocido viene de universo.json cuando universe_type=verified;
+    para universe_type=expanded no hay ticker de antemano -- se abre la
+    Company directo por CIK (edgartools acepta cik_or_ticker) y se
+    resuelve el ticker desde ahi, si tiene uno listado.
 
     Devuelve (filas, resuelto). `resuelto` distingue dos casos que NO son
     lo mismo y que al principio se trataban igual (bug 2026-09-11):
@@ -219,11 +239,14 @@ def parsear_form4_puntual(ticker, cik, accession_no):
                          empresa). Eso SI se reintenta en el proximo ciclo.
     Sin esta distincion habia que elegir entre perder filings por un error
     transitorio, o reintentar para siempre los que no tienen filas."""
+    ticker = ticker_conocido
     try:
-        company = Company(ticker)
+        company = Company(ticker_conocido or cik)
+        if ticker is None and getattr(company, "tickers", None):
+            ticker = company.tickers[0]
         filings = company.get_filings(form="4").head(50)
     except Exception as e:
-        print(f"    ERROR abriendo {ticker}: {e}")
+        print(f"    ERROR abriendo cik={cik} ticker={ticker_conocido}: {e}")
         return [], False
 
     objetivo = None
@@ -281,7 +304,7 @@ def parsear_form4_puntual(ticker, cik, accession_no):
         footnote_texts = [footnote_map.get(r) for r in refs if footnote_map.get(r)]
 
         filas.append({
-            "cik": cik, "ticker": ticker, "accession_no": accession_no,
+            "cik": cik, "ticker": ticker, "universe_type": universe_type, "accession_no": accession_no,
             "filing_date": filing_date, "form_type": form_type,
             "owner_names": owner_names, "owner_titles": owner_titles,
             "is_officer": is_officer_any, "is_director": is_director_any,
@@ -331,13 +354,20 @@ def main():
 
         nuevas_filas = []
         for e in entradas:
-            if e["cik"] not in por_cik:
-                continue
             if e["accession_no"] in vistos:
                 continue
-            ticker = por_cik[e["cik"]]
-            print(f"  ciclo {ciclos}: {ticker} ({e['cik']}, {e['rol']}) {e['accession_no']} -- parseando...")
-            filas, resuelto = parsear_form4_puntual(ticker, e["cik"], e["accession_no"])
+            if e["rol"] != "Issuer":
+                # Sin el filtro de universo (que antes descartaba esto solo
+                # porque el CIK de una PERSONA nunca coincide con el de una
+                # empresa) hay que filtrar por rol explicitamente -- la fila
+                # "Reporting"/"Filer" es el insider, no la empresa, y
+                # Company(cik_persona) no tiene sentido abrir.
+                continue
+            ticker_conocido = por_cik.get(e["cik"])
+            universe_type = "verified" if ticker_conocido else "expanded"
+            etiqueta = ticker_conocido or f"cik:{e['cik']}"
+            print(f"  ciclo {ciclos}: {etiqueta} ({universe_type}, {e['rol']}) {e['accession_no']} -- parseando...")
+            filas, resuelto = parsear_form4_puntual(e["cik"], e["accession_no"], universe_type, ticker_conocido)
             # MARCAR COMO VISTO SOLO SI SE RESOLVIO (bug 2026-09-11): antes
             # se marcaba ANTES de parsear, asi que un timeout o un error
             # puntual de edgartools quemaba ese accession_no para siempre
@@ -347,6 +377,7 @@ def main():
                 marcar_visto(vistos, orden_vistos, e["accession_no"])
                 if filas:
                     nuevas_filas.extend(filas)
+            time.sleep(SLEEP_ENTRE_FILINGS)
 
         if nuevas_filas:
             ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
