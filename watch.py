@@ -219,7 +219,7 @@ def parsear_entradas_feed(xml_text):
     return entradas
 
 
-def parsear_form4_puntual(cik, accession_no, universe_type, ticker_conocido=None):
+def parsear_form4_puntual(cik, accession_no, universe_type, aceptado_en, ticker_conocido=None):
     """Busca ESE accession_no puntual en los filings recientes de la
     empresa -- no escanea el historial completo. El feed ya nos dijo que
     es nuevo, esto solo trae el detalle (owners, shares, price, code).
@@ -305,6 +305,7 @@ def parsear_form4_puntual(cik, accession_no, universe_type, ticker_conocido=None
 
         filas.append({
             "cik": cik, "ticker": ticker, "universe_type": universe_type, "accession_no": accession_no,
+            "aceptado_en": aceptado_en,  # <updated> del feed SEC -- hora real de aceptacion, para medir latencia end-to-end
             "filing_date": filing_date, "form_type": form_type,
             "owner_names": owner_names, "owner_titles": owner_titles,
             "is_officer": is_officer_any, "is_director": is_director_any,
@@ -367,7 +368,7 @@ def main():
             universe_type = "verified" if ticker_conocido else "expanded"
             etiqueta = ticker_conocido or f"cik:{e['cik']}"
             print(f"  ciclo {ciclos}: {etiqueta} ({universe_type}, {e['rol']}) {e['accession_no']} -- parseando...")
-            filas, resuelto = parsear_form4_puntual(e["cik"], e["accession_no"], universe_type, ticker_conocido)
+            filas, resuelto = parsear_form4_puntual(e["cik"], e["accession_no"], universe_type, e["aceptado_en"], ticker_conocido)
             # MARCAR COMO VISTO SOLO SI SE RESOLVIO (bug 2026-09-11): antes
             # se marcaba ANTES de parsear, asi que un timeout o un error
             # puntual de edgartools quemaba ese accession_no para siempre
