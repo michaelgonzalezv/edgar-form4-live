@@ -85,10 +85,16 @@ FEED_URL = ("https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent"
             "&type=4&company=&dateb=&owner=include&count=100&output=atom")
 HEADERS = {"User-Agent": "Michael michael.gonzalez@correounivalle.edu.co"}
 
-INTERVALO_POLL = 20          # segundos entre consultas al feed
+INTERVALO_POLL = 1           # segundos entre consultas al feed -- 1 req/s, muy por debajo
+                              # del fair-use de SEC (10 req/s, ver docs.sec.gov/webmaster-faq).
+                              # Bajado de 20s a 1s el 2026-09-16 tras medir con aceptado_en que
+                              # el polling artificial (hasta 20s) pesaba mas que el tramo SEC->feed
+                              # (15-30s medido, no controlable). El throttle por-filing
+                              # (SLEEP_ENTRE_FILINGS) es un control aparte, sigue igual.
 SLEEP_ENTRE_FILINGS = 0.35   # entre parseos individuales dentro de un mismo ciclo -- fair-use SEC
 DURACION_MAX = int(os.environ.get("WATCH_DURACION_SEG", 5 * 3600 + 40 * 60))  # override para pruebas cortas
 MAX_VISTOS = 20_000           # recorte del set de accession_no ya vistos
+CICLOS_POR_LATIDO = max(1, 600 // INTERVALO_POLL)  # ~10 min de latido, sea cual sea el poll
 
 # BUG CRITICO ENCONTRADO 2026-09-11, despues de desplegar: este regex
 # exigia el rol (Filer|Subject|Reporting) y NO aceptaba (Issuer). En un
@@ -393,7 +399,7 @@ def main():
             commit_y_push(f"watch: {len(nuevas_filas)} transacciones nuevas "
                            f"({datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')})")
 
-        if ciclos % 30 == 0:  # latido cada ~10 min (30 ciclos x 20s)
+        if ciclos % CICLOS_POR_LATIDO == 0:  # latido cada ~10 min, independiente de INTERVALO_POLL
             # Envuelto porque publicar el latido NO puede ser motivo para
             # perder el watcher: si git falla, prefiero un latido viejo y un
             # loop vivo antes que un latido perfecto y un proceso muerto.
