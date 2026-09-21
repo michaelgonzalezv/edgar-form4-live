@@ -24,7 +24,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # historial completo, no shallow -- watch.py hace pull --rebase si hace falta
+          # FIX 2026-09-21 (causa raiz de los "huecos" de deteccion): por defecto checkout@v4 usa el SHA con el que se
+          # CREO la corrida programada. Como una corrida espera en cola (concurrency) hasta que termina la anterior
+          # (340 min), main ya avanzo y el checkout dejaba el repo en un commit VIEJO: todos los `git push` eran
+          # non-fast-forward durante 5,7 h (la corrida detectaba pero no publicaba) y las corridas alternaban
+          # 340 min sana / 340 min muda. Con `ref: main` el checkout es SIEMPRE el ultimo main.
+          ref: main
+          fetch-depth: 0  # historial completo, no shallow
 
       - uses: actions/setup-python@v5
         with:

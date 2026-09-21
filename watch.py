@@ -174,7 +174,30 @@ def git(*args, check=True):
         return subprocess.CompletedProcess(args, returncode=1, stdout="", stderr="timeout")
 
 
+# Recuperacion (2026-09-21, ver HALLAZGOS §80): si el push falla de forma sostenida (repo local desincronizado de origin,
+# como ocurria con el checkout de SHA viejo) el proceso TERMINA en vez de seguir "vivo" y mudo durante horas: el job falla,
+# el cron programado lo reemplaza en minutos, y la corrida nueva arranca con fetch + reset --hard a origin/main. Lo que
+# esta corrida detecto y NO pudo publicar se re-detecta en la siguiente (vistos.json publicado no lo incluye): sin duplicados.
+FALLOS_PUSH_MAX = int(os.environ.get("WATCH_FALLOS_PUSH_MAX", 3))
+_fallos_push_consecutivos = 0
+
+
+def sincronizar_con_origin():
+    """Deja el checkout EXACTAMENTE en origin/main (descarta commits locales sin publicar). True si lo logro."""
+    r = git("fetch", "origin", "main", check=False)
+    if r.returncode != 0:
+        print(f"AVISO: fetch origin main fallo al arrancar: {r.stderr.strip()[-200:]}")
+        return False
+    git("rebase", "--abort", check=False)
+    r = git("reset", "--hard", "origin/main", check=False)
+    if r.returncode != 0:
+        print(f"AVISO: reset --hard origin/main fallo: {r.stderr.strip()[-200:]}")
+        return False
+    return True
+
+
 def commit_y_push(mensaje):
+    global _fallos_push_consecutivos
     git("add", "data")
     diff = git("diff", "--cached", "--quiet", check=False)
     if diff.returncode == 0:
@@ -183,12 +206,19 @@ def commit_y_push(mensaje):
     for intento in range(5):
         r = git("push", check=False)
         if r.returncode == 0:
+            _fallos_push_consecutivos = 0
             return
-        git("pull", "--rebase", check=False)
+        print(f"  AVISO: push intento {intento + 1}/5 fallo: {(r.stderr or '').strip()[-200:]}")
+        rp = git("pull", "--rebase", check=False)
+        if rp.returncode != 0:
+            git("rebase", "--abort", check=False)   # nunca dejar un rebase a medias: bloquearia todo lo siguiente
         time.sleep(2)
-    print("AVISO: push fallo tras 5 reintentos, sigue en el proximo commit")
-
-
+    _fallos_push_consecutivos += 1
+    print(f"AVISO: push fallo tras 5 reintentos ({_fallos_push_consecutivos}/{FALLOS_PUSH_MAX} consecutivos)")
+    if _fallos_push_consecutivos >= FALLOS_PUSH_MAX:
+        print("FATAL: push sostenidamente roto -- se termina la corrida para que el cron programe una nueva "
+              "(que arranca con fetch + reset --hard origin/main)", flush=True)
+        sys.exit(3)   # SystemExit: no lo atrapan los `except Exception` del loop
 def parsear_entradas_feed(xml_text):
     """Parseo minimo por regex, no XML completo -- el feed atom de EDGAR
     es simple y esto evita una dependencia extra. entry -> (titulo, cik,
@@ -332,6 +362,12 @@ def parsear_form4_puntual(cik, accession_no, universe_type, aceptado_en, ticker_
 
 def main():
     os.makedirs(INBOX_DIR, exist_ok=True)
+    sincronizado = sincronizar_con_origin()   # ANTES de leer vistos/universo: parten del ultimo estado publicado
+    sha_inicio = git("rev-parse", "HEAD", check=False).stdout.strip() or None
+    info_corrida = {"run_id": os.environ.get("GITHUB_RUN_ID"), "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+                    "sha_inicio": sha_inicio, "sincronizado_al_inicio": sincronizado,
+                    "inicio_corrida": datetime.now(timezone.utc).isoformat()}
+    print(f"corrida {info_corrida['run_id']} arranca en {sha_inicio} (sincronizado={sincronizado})", flush=True)
     universo = cargar_json(UNIVERSO_PATH, [])
     por_cik = {int(e["cik"]): e["ticker"] for e in universo}
     print(f"universo: {len(por_cik)} empresas")
@@ -406,7 +442,7 @@ def main():
             try:
                 guardar_json(LATIDO_PATH, {
                     "ultimo_latido": datetime.now(timezone.utc).isoformat(),
-                    "ciclos": ciclos, "total_encontradas": total_encontradas,
+                    "ciclos": ciclos, "total_encontradas": total_encontradas, **info_corrida,
                 })
                 commit_y_push(f"watch: latido ciclo {ciclos}")
                 guardar_json(VISTOS_PATH, orden_vistos)
@@ -421,7 +457,7 @@ def main():
     guardar_json(VISTOS_PATH, orden_vistos)
     guardar_json(LATIDO_PATH, {
         "ultimo_latido": datetime.now(timezone.utc).isoformat(),
-        "ciclos": ciclos, "total_encontradas": total_encontradas, "cerrado_por_duracion_max": True,
+        "ciclos": ciclos, "total_encontradas": total_encontradas, "cerrado_por_duracion_max": True, **info_corrida,
     })
     commit_y_push(f"watch: cierre de corrida ({ciclos} ciclos, {total_encontradas} hallazgos)")
 
