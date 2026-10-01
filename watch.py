@@ -255,6 +255,39 @@ def parsear_entradas_feed(xml_text):
     return entradas
 
 
+def extraer_nombre_issuer(titulo, cik, form_type):
+    """Nombre del emisor TAL CUAL aparece en el <title> del feed, ej.
+    "4 - MESA LABORATORIES INC /CO/ (0000724004) (Issuer)" -> "MESA
+    LABORATORIES INC /CO/". Ancla EXPLICITA en form_type y cik -- datos
+    que ya tenemos de esta misma entrada del feed, nunca se adivinan --
+    en vez de una regex agresiva sobre el nombre: nombres reales traen
+    comas, puntos, "/DE/"/"/CO/" (sufijo de estado de incorporacion,
+    200+ casos verificados contra company_tickers.json 2026-10-01) e
+    incluso parentesis propios ("Banco Santander (Brasil) S.A.",
+    "ACUITY INC. (DE)") -- una regex que intente "capturar lo que esta
+    entre parentesis" se rompe con esos casos. Acá se pela el prefijo
+    "<form_type> - " y el sufijo " (<cik>) (Issuer)" de forma LITERAL
+    (ambos ya conocidos) y se toma lo que quede en el medio tal cual,
+    sin tocarlo. Formato de title verificado en vivo (2026-10-01) para
+    "4" y "4/A" -- ambos usan el mismo patron "<form_type> - ...".
+    Si el titulo no calza EXACTO con el patron esperado (cualquier
+    motivo: formato de SEC cambio, entrada corrupta, etc.) devuelve
+    None -- nunca se inventa ni se aproxima un nombre."""
+    if not titulo or cik is None or not form_type:
+        return None
+    t = titulo.strip()
+    prefijo = f"{form_type} - "
+    if not t.startswith(prefijo):
+        return None
+    resto = t[len(prefijo):]
+    for cik_str in (f"{int(cik):010d}", str(int(cik))):
+        sufijo = f" ({cik_str}) (Issuer)"
+        if resto.endswith(sufijo):
+            nombre = resto[:-len(sufijo)].strip()
+            return nombre or None
+    return None
+
+
 def parsear_form4_puntual(cik, accession_no, universe_type, aceptado_en, ticker_conocido=None):
     """Busca ESE accession_no puntual en los filings recientes de la
     empresa -- no escanea el historial completo. El feed ya nos dijo que
@@ -419,6 +452,13 @@ def main():
             if resuelto:
                 marcar_visto(vistos, orden_vistos, e["accession_no"])
                 if filas:
+                    # issuer_name_filing (2026-10-02): nombre del emisor tal cual en el <title> de ESTA
+                    # entrada del feed -- cero llamadas nuevas, el titulo ya se trajo arriba. Aditivo puro:
+                    # campo nuevo, nada mas de esta fila cambia. None si no calza el patron esperado (ver
+                    # extraer_nombre_issuer), nunca se inventa.
+                    nombre_issuer = extraer_nombre_issuer(e.get("titulo"), e.get("cik"), e.get("form_type"))
+                    for fila in filas:
+                        fila["issuer_name_filing"] = nombre_issuer
                     nuevas_filas.extend(filas)
             time.sleep(SLEEP_ENTRE_FILINGS)
 
