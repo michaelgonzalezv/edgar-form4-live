@@ -47,6 +47,18 @@ privado.
 5. `data/latido.json` se actualiza cada ~10 min aunque no haya hallazgos,
    para poder confirmar que el loop sigue vivo sin esperar un filing real.
 
+## Campo `issuer_name_filing` (2026-10-02)
+
+Cada fila de `data/inbox/*.jsonl` trae `issuer_name_filing`: el nombre del
+emisor tal cual aparece en el `<title>` del feed al detectar (ej. `"MESA
+LABORATORIES INC /CO/"`), o `null` si el título no calzó el patrón esperado.
+Cero llamadas SEC nuevas -- el título ya se trae como parte del scan del
+feed. Parser (`extraer_nombre_issuer()`) ancla en `cik`+`form_type` ya
+conocidos de la misma entrada, nunca una regex agresiva sobre el nombre
+libre (nombres reales traen comas, `/DE/`/`/CO/`, paréntesis propios).
+Consumido por Information Factor para mostrar el nombre del emisor en el
+tooltip de Portfolio Live -- ver §106 de `HALLAZGOS_PENDIENTES.md` ahí.
+
 ## Mezcla a edgar_data.db
 
 Mismo mecanismo y mismo script que `edgar-form4-feed`:
