@@ -345,6 +345,7 @@ def parsear_form4_puntual(cik, accession_no, universe_type, aceptado_en, ticker_
     is_officer_any = any(o.is_officer for o in owners_list)
     is_director_any = any(o.is_director for o in owners_list)
     is_ten_pct_any = any(o.is_ten_pct_owner for o in owners_list)
+    is_other_any = any(o.is_other for o in owners_list)  # checkbox SEC real (isOther), nunca inferido
 
     nd_table = form4.non_derivative_table
     parts = []
@@ -378,7 +379,7 @@ def parsear_form4_puntual(cik, accession_no, universe_type, aceptado_en, ticker_
             "filing_date": filing_date, "form_type": form_type,
             "owner_names": owner_names, "owner_titles": owner_titles,
             "is_officer": is_officer_any, "is_director": is_director_any,
-            "is_ten_pct_owner": is_ten_pct_any,
+            "is_ten_pct_owner": is_ten_pct_any, "is_other": is_other_any,
             "security": row.get("Security"), "transaction_date": str(row.get("Date")),
             "code": code, "shares": shares, "signed_shares": signed_shares,
             "acquired_disposed": acquired_disposed, "price": row.get("Price"),
